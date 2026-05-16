@@ -108,6 +108,54 @@ func (m *MockAuditWriter) DroppedCount() int {
 	return n
 }
 
+// MockPeerManager records peer operations for testing.
+type MockPeerManager struct {
+	mu    sync.Mutex
+	peers map[[32]byte]mockPeerEntry
+}
+
+type mockPeerEntry struct {
+	allowedIPs []net.IPNet
+	endpoint   string
+}
+
+// AddPeer implements shim.PeerManager.
+func (m *MockPeerManager) AddPeer(pubKey [32]byte, allowedIPs []net.IPNet, endpoint string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.peers == nil {
+		m.peers = make(map[[32]byte]mockPeerEntry)
+	}
+	m.peers[pubKey] = mockPeerEntry{allowedIPs: allowedIPs, endpoint: endpoint}
+	return nil
+}
+
+// RemovePeer implements shim.PeerManager.
+func (m *MockPeerManager) RemovePeer(pubKey [32]byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.peers, pubKey)
+	return nil
+}
+
+// SetPrivateKey implements shim.PeerManager.
+func (m *MockPeerManager) SetPrivateKey(_ [32]byte) error { return nil }
+
+// HasPeer returns true if the given public key is currently tracked.
+func (m *MockPeerManager) HasPeer(pubKey [32]byte) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.peers[pubKey]
+	return ok
+}
+
+// PeerCount returns the number of tracked peers.
+func (m *MockPeerManager) PeerCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.peers)
+}
+
 // MockConn implements net.Conn for testing. Always returns n=len(b) on Read.
 type MockConn struct{}
 

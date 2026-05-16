@@ -14,6 +14,8 @@
 
 package shim
 
+import "net"
+
 // WireGuardBind describes the minimal interface the netstack bridge needs to
 // hand packets to wireguard-go for encryption and UDP delivery.
 type WireGuardBind interface {
@@ -37,4 +39,13 @@ type WireGuardEndpoint struct {
 
 	// Close releases the underlying resources.
 	Close func() error
+}
+
+// PeerManager manages WireGuard peers. The implementation (typically a
+// wireguard-go device wrapper) is injected by the caller; shim itself does
+// not import wireguard-go.
+type PeerManager interface {
+	AddPeer(pubKey [32]byte, allowedIPs []net.IPNet, endpoint string) error
+	RemovePeer(pubKey [32]byte) error
+	SetPrivateKey(key [32]byte) error
 }
