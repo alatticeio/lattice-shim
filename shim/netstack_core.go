@@ -109,9 +109,10 @@ func NewNetstack(localIP string, opts ...NetstackOption) (*Netstack, error) {
 		return nil, fmt.Errorf("AddProtocolAddress: %s", err)
 	}
 
-	// Default route: loopback first, then channel NIC.
+	// Route loopback addresses to the loopback NIC; everything else
+	// goes through the channel NIC for outbound (WireGuard overlay).
 	s.SetRouteTable([]tcpip.Route{
-		{Destination: header.IPv4EmptySubnet, NIC: loID},
+		{Destination: header.IPv4LoopbackSubnet, NIC: loID},
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
 	})
 
