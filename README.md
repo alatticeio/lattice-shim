@@ -49,35 +49,49 @@ runs in user space: no TUN device, no `CAP_NET_ADMIN`, no root.
 
 ## Architecture
 
-The core type is **`Netstack`** — a user-space TCP/IP stack. Callers inject
-optional **BeforeDial** / **AfterDial** hooks for policy checking, audit
-writing, rate limiting, or metrics.
+The library has two layers:
+
+**`Netstack`** — a user-space TCP/IP stack. Callers inject optional
+**BeforeDial** / **AfterDial** hooks for policy checking, audit writing,
+rate limiting, or metrics.
+
+**`Sandbox`** — the top-level compositor. Wires together a `Netstack`,
+`Socks5Server` (workload outbound proxy), `ForwardListener` (inbound relay),
+and an optional `PeerManager` (WireGuard peer lifecycle). The caller injects
+concrete implementations of `PolicyChecker`, `AuditWriter`, and `PeerManager`.
 
 ```
-┌──────────────────────────────┐
-│          Netstack            │
-│  Identity string             │
-│  BeforeDial func (optional)  │
-│  AfterDial  func (optional)  │
-│  ┌────────────────────────┐  │
-│  │  gVisor user-space     │  │
-│  │  TCP/IP stack          │  │
-│  └────────────────────────┘  │
-└──────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Sandbox                                                 │
+│                                                          │
+│  ┌─────────────────┐   ┌──────────────────────────────┐  │
+│  │  Socks5Server   │   │  ForwardListener             │  │
+│  │  outbound proxy │   │  overlay → workload inbound  │  │
+│  └────────┬────────┘   └──────────────┬───────────────┘  │
+│           │                           │                  │
+│           ▼                           ▼                  │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │  Netstack  (gVisor user-space TCP/IP)            │    │
+│  │  BeforeDial → PolicyChecker.Allow(...)           │    │
+│  │  AfterDial  → AuditWriter.Write(...)             │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                          │
+│  PeerManager (injected) — AddPeer / RemovePeer           │
+└──────────────────────────────────────────────────────────┘
 ```
-
-Convenience functions `WithPolicy` and `WithAudit` adapt the
-`PolicyChecker` and `AuditWriter` interfaces into hooks.
 
 ### Package layout
 
 ```
 shim/
+├── shim.go            Sandbox compositor — New / Start / Close / AddPeer
 ├── netstack_core.go   Netstack struct — user-space TCP/IP
 ├── netstack.go        NetstackOption + With* functions
+├── forward.go         ForwardListener — overlay inbound relay
+├── egress.go          EgressFilter — CIDR allowlist, implements PolicyChecker
 ├── policy.go          PolicyChecker interface
 ├── audit.go           AuditWriter interface + AuditEvent struct
-├── wireguard.go       WireGuardEndpoint / WireGuardBind interfaces
+├── wireguard.go       WireGuardEndpoint / WireGuardBind / PeerManager interfaces
 └── internal/test/     Mock implementations for testing
 ```
 
@@ -93,8 +107,8 @@ type PolicyChecker interface {
 }
 ```
 
-Called before every connection (via `WithPolicy`). Return `false` to deny
-the connection. If no policy is set, all connections are allowed.
+Called before every outbound connection (via `WithPolicy`). Return `false`
+to deny. If no policy is set, all connections are allowed.
 
 ### AuditWriter
 
@@ -116,6 +130,22 @@ type AuditEvent struct {
 Receives every allow/drop decision (via `WithAudit`). Your implementation
 might batch events and POST them to a control plane, write to a local log,
 or feed an alerting pipeline.
+
+### PeerManager
+
+```go
+type PeerManager interface {
+    AddPeer(pubKey [32]byte, allowedIPs []net.IPNet, endpoint string) error
+    RemovePeer(pubKey [32]byte) error
+    SetPrivateKey(key [32]byte) error
+}
+```
+
+Manages WireGuard peers. The implementation (typically a wireguard-go device
+wrapper) is injected by the caller. The shim itself does not import
+wireguard-go, keeping the dependency boundary clean. The caller's
+`WireGuardManager` subscribes to topology changes (e.g. via NATS) and calls
+`sb.AddPeer` / `sb.RemovePeer` in response.
 
 ### WireGuardBind
 
@@ -140,79 +170,100 @@ wireguard-go's device bind.
 go get github.com/alatticeio/lattice-shim
 ```
 
-### 2. Simplest usage
+### 2. Full Sandbox (recommended)
+
+The `Sandbox` is the primary entry point. It wires everything together:
 
 ```go
 package main
 
 import (
     "context"
-    "fmt"
+    "net"
 
     "github.com/alatticeio/lattice-shim/shim"
 )
 
 func main() {
-    // Create a user-space netstack — no policy, no audit.
-    ns, err := shim.NewNetstack("10.100.0.1")
+    sb, err := shim.New("10.100.0.1",
+        // Netstack options: identity, policy, audit.
+        shim.WithNetstack(
+            shim.WithIdentity("sandbox:agent-1"),
+            shim.WithPolicy(myPolicy),   // implements shim.PolicyChecker
+            shim.WithAudit(myAudit),     // implements shim.AuditWriter
+        ),
+        // Workload outbound proxy — set ALL_PROXY=socks5://127.0.0.1:1080.
+        shim.WithSOCKS5("127.0.0.1:1080"),
+        // Inbound relay: overlay :8080 → workload local :8080.
+        shim.WithForwardRule(8080, "127.0.0.1:8080"),
+        // WireGuard peer manager (wireguard-go device wrapper from caller).
+        shim.WithPeerManager(myWgDevice),
+    )
     if err != nil {
         panic(err)
     }
-    defer ns.Close()
+    defer sb.Close()
 
-    // Dial through the user-space stack.
-    conn, err := ns.DialContext(context.Background(), "tcp", "10.200.0.5:443")
-    if err != nil {
-        fmt.Println("dial failed:", err)
-        return
+    ctx := context.Background()
+    if err := sb.Start(ctx); err != nil {
+        panic(err)
     }
-    defer conn.Close()
 
-    // conn is a standard net.Conn — use it like any TCP connection.
-    conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
+    // Caller's WireGuardManager subscribes to NATS / topology changes
+    // and calls sb.AddPeer / sb.RemovePeer accordingly.
+    var pubKey [32]byte
+    copy(pubKey[:], peerPublicKey)
+    _, subnet, _ := net.ParseCIDR("10.100.0.2/32")
+    sb.AddPeer(pubKey, []net.IPNet{*subnet}, "203.0.113.1:51820")
+
+    // Workload subprocess sets ALL_PROXY=socks5://127.0.0.1:1080 and runs
+    // normally — all outbound traffic routes through the Sandbox netstack,
+    // through PolicyChecker, and out via wireguard-go.
+    select {}
 }
 ```
 
-### 3. With identity and hooks
+### 3. Netstack only (lower-level)
 
 ```go
-ns, _ := shim.NewNetstack("10.100.0.1",
+ns, err := shim.NewNetstack("10.100.0.1",
     shim.WithIdentity("my-service/instance-3"),
-    shim.WithBeforeDial(func(identity, network, addr string) error {
-        if !isAllowed(addr) {
-            return errors.New("connection denied")
-        }
-        return nil
-    }),
-    shim.WithAfterDial(func(identity, network, addr string, conn net.Conn, err error) {
-        log.Printf("dial: id=%s network=%s addr=%s err=%v", identity, network, addr, err)
-    }),
+    shim.WithPolicy(myPolicy),
+    shim.WithAudit(myAudit),
 )
+if err != nil {
+    panic(err)
+}
+defer ns.Close()
+
+// Dial through the user-space stack.
+conn, err := ns.DialContext(context.Background(), "tcp", "10.200.0.5:443")
+// conn is a standard net.Conn.
+
+// Listen on the overlay IP (for inbound connections).
+ln, err := ns.ListenTCP("10.100.0.1:8080")
 ```
 
-### 4. With PolicyChecker / AuditWriter interfaces
+### 4. EgressFilter — built-in CIDR allowlist
+
+`EgressFilter` implements `PolicyChecker` with atomic hot-reload:
 
 ```go
-// Implement the interfaces (or use nil for all-allow / no-audit).
-type MyPolicy struct{}
+filter := shim.NewEgressFilter(shim.EgressPolicy{
+    DefaultDeny:  true,
+    AllowedCIDRs: []net.IPNet{overlaySubnet},
+})
 
-func (p *MyPolicy) Allow(identity string, dstIP net.IP, dstPort uint16) bool {
-    return dstPort == 443
-}
-
-type MyAudit struct{}
-
-func (a *MyAudit) Write(ev shim.AuditEvent) error {
-    log.Printf("AUDIT: identity=%s dst=%s:%d verdict=%s", ev.Identity, ev.DstIP, ev.DstPort, ev.Verdict)
-    return nil
-}
-
-// Wire them up via convenience options.
-ns, _ := shim.NewNetstack("10.100.0.1",
-    shim.WithIdentity("sandbox:agent-1"),
-    shim.WithPolicy(&MyPolicy{}),
-    shim.WithAudit(&MyAudit{}),
+sb, _ := shim.New("10.100.0.1",
+    shim.WithNetstack(shim.WithPolicy(filter)),
+    shim.WithSOCKS5("127.0.0.1:1080"),
 )
+
+// Hot-reload policy without restart (e.g. after receiving a NATS update).
+filter.Update(shim.EgressPolicy{
+    DefaultDeny:  true,
+    AllowedCIDRs: []net.IPNet{overlaySubnet, apiSubnet},
+})
 ```
 
 ### 5. With WireGuard integration
@@ -246,17 +297,65 @@ ep := &shim.WireGuardEndpoint{
 
 ---
 
+## Communication paths
+
+### Outbound (workload → overlay peer)
+
+```
+Workload subprocess
+  ALL_PROXY=socks5://127.0.0.1:1080
+  └─▶ Socks5Server
+        └─▶ EgressFilter.Allow(identity, dstIP, dstPort)
+              ├─ deny  → EPERM + AuditWriter.Write(drop)
+              └─ allow → AuditWriter.Write(allow)
+                          └─▶ Netstack (gVisor TCP/IP)
+                                └─▶ wireguard-go encrypt → UDP → peer
+```
+
+### Inbound (overlay peer → workload)
+
+```
+Remote peer → UDP → wireguard-go decrypt
+  └─▶ Netstack (gVisor TCP/IP)
+        └─▶ ForwardListener.ListenTCP(overlayIP:port)
+              └─▶ dial(targetAddr) → Workload local service
+```
+
+Policy checks are performed on the **outbound side only**. The
+`ForwardListener` does not re-check policy — the originating sandbox already
+enforced it.
+
+---
+
 ## API Reference
+
+### Sandbox
+
+```go
+func New(overlayIP string, opts ...Option) (*Sandbox, error)
+func (s *Sandbox) Start(ctx context.Context) error
+func (s *Sandbox) Close() error
+func (s *Sandbox) Netstack() *Netstack
+func (s *Sandbox) Socks5Addr() string
+
+// PeerManager delegation — returns error if no PeerManager configured.
+func (s *Sandbox) AddPeer(pubKey [32]byte, allowedIPs []net.IPNet, endpoint string) error
+func (s *Sandbox) RemovePeer(pubKey [32]byte) error
+func (s *Sandbox) SetPrivateKey(key [32]byte) error
+```
+
+### Sandbox options
+
+```go
+func WithNetstack(opts ...NetstackOption) Option  // forwards to Netstack
+func WithSOCKS5(addr string) Option               // e.g. "127.0.0.1:1080"
+func WithForwardRule(overlayPort uint16, targetAddr string) Option
+func WithPeerManager(pm PeerManager) Option
+```
 
 ### Netstack
 
 ```go
-type Netstack struct {
-    Identity   string
-    BeforeDial func(identity, network, addr string) error
-    AfterDial  func(identity, network, addr string, conn net.Conn, err error)
-}
-
 func NewNetstack(localIP string, opts ...NetstackOption) (*Netstack, error)
 func (ns *Netstack) DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 func (ns *Netstack) ListenTCP(addr string) (net.Listener, error)
@@ -265,7 +364,7 @@ func (ns *Netstack) Stack() *stack.Stack
 func (ns *Netstack) Close() error
 ```
 
-### Options
+### Netstack options
 
 ```go
 func WithIdentity(id string) NetstackOption
@@ -273,6 +372,19 @@ func WithBeforeDial(fn func(identity, network, addr string) error) NetstackOptio
 func WithAfterDial(fn func(identity, network, addr string, conn net.Conn, err error)) NetstackOption
 func WithPolicy(pc PolicyChecker) NetstackOption
 func WithAudit(aw AuditWriter) NetstackOption
+```
+
+### EgressFilter
+
+```go
+func NewEgressFilter(initial EgressPolicy) *EgressFilter
+func (f *EgressFilter) Allow(identity string, dstIP net.IP, dstPort uint16) bool
+func (f *EgressFilter) Update(p EgressPolicy)
+
+type EgressPolicy struct {
+    AllowedCIDRs []net.IPNet
+    DefaultDeny  bool
+}
 ```
 
 ---
@@ -284,9 +396,10 @@ under `internal/agent/gvisor/`:
 
 ```
 lattice/internal/agent/gvisor/
-├── manager.go           # SandboxManager → creates Netstack for each sandbox
+├── manager.go           # SandboxManager → creates Sandbox for each agent
 ├── policy_adapter.go    # PolicyCache → shim.PolicyChecker adapter
 ├── audit_adapter.go     # AuditBatcher → shim.AuditWriter adapter
+├── wg_adapter.go        # wireguard-go device → shim.PeerManager adapter
 └── ...
 ```
 
@@ -295,8 +408,6 @@ lattice/internal/agent/gvisor/
 **Policy adapter:**
 
 ```go
-import "github.com/alatticeio/lattice-shim/shim"
-
 type PolicyAdapter struct {
     cache     *sidecar.PolicyCache
     sandboxID string
@@ -307,34 +418,54 @@ func (a *PolicyAdapter) Allow(identity string, dstIP net.IP, dstPort uint16) boo
 }
 ```
 
+**WireGuard peer manager adapter:**
+
+```go
+type WgAdapter struct{ dev *device.Device }
+
+func (a *WgAdapter) AddPeer(pubKey [32]byte, allowedIPs []net.IPNet, endpoint string) error {
+    // configure wireguard-go device peer
+}
+func (a *WgAdapter) RemovePeer(pubKey [32]byte) error { ... }
+func (a *WgAdapter) SetPrivateKey(key [32]byte) error { ... }
+```
+
 **Usage in manager.go:**
 
 ```go
-ns, _ := shim.NewNetstack(agentIP,
-    shim.WithIdentity("sandbox:"+sandboxID),
-    shim.WithPolicy(&PolicyAdapter{cache: policyCache, sandboxID: sandboxID}),
-    shim.WithAudit(&AuditAdapter{batcher: auditBatcher}),
+sb, _ := shim.New(agentOverlayIP,
+    shim.WithNetstack(
+        shim.WithIdentity("sandbox:"+sandboxID),
+        shim.WithPolicy(&PolicyAdapter{cache: policyCache, sandboxID: sandboxID}),
+        shim.WithAudit(&AuditAdapter{batcher: auditBatcher}),
+    ),
+    shim.WithSOCKS5("127.0.0.1:1080"),
+    shim.WithForwardRule(8080, "127.0.0.1:8080"),
+    shim.WithPeerManager(&WgAdapter{dev: wgDevice}),
 )
+sb.Start(ctx)
+
+// WireGuardManager subscribes to NATS NetMap and calls:
+sb.AddPeer(pubKey, allowedIPs, endpoint)
 ```
 
 ### Dependency flow
 
 ```
 lattice-shim (zero Lattice deps)
-  ├─ gvisor.dev/gvisor
-  └─ golang.zx2c4.com/wireguard
+  └─ gvisor.dev/gvisor
 
 lattice/internal/agent/gvisor/ (Lattice main repo)
   ├─ github.com/alatticeio/lattice-shim
-  ├─ lattice/internal/agent/sidecar   ← PolicyCache implementation
-  ├─ lattice/internal/agent/audit     ← AuditBatcher implementation
+  ├─ golang.zx2c4.com/wireguard      ← wireguard-go (main repo, not shim)
+  ├─ lattice/internal/agent/sidecar  ← PolicyCache implementation
+  ├─ lattice/internal/agent/audit    ← AuditBatcher implementation
   └─ ...
 ```
 
-The shim stays pure: it does not know about Lattice CRDs, NATS, or
-control-plane protocols. The adapter layer in the Lattice main repo
-translates between Lattice concepts (PolicyCache, AuditBatcher) and
-shim interfaces (PolicyChecker, AuditWriter).
+The shim stays pure: it does not know about wireguard-go internals, Lattice
+CRDs, NATS, or control-plane protocols. The adapter layer in the Lattice main
+repo translates between Lattice concepts and shim interfaces.
 
 ---
 
@@ -344,24 +475,18 @@ Since `lattice-shim` has **zero Lattice-specific dependencies**, you can use
 it in any Go project that needs:
 
 - A user-space TCP/IP stack (gVisor) without root
-- WireGuard encryption in user space
-- Pluggable hooks for outbound connections
-- Audit logging of allow/drop decisions
-
-### Step-by-step
-
-1. **Implement interfaces** (or use `nil` for all-allow / no-audit).
-2. **Create the Netstack** with `shim.NewNetstack(localIP, opts...)`.
-3. **Use `ns.DialContext()`** wherever you need a user-space TCP connection.
+- SOCKS5 proxy for workload outbound traffic with policy enforcement
+- Inbound port forwarding over a WireGuard overlay
+- Pluggable hooks for outbound connections and audit logging
 
 ### Example use cases
 
-| Use case | Hooks | Audit |
-|---|---|---|
-| AI agent sandbox | Allow-list of API endpoints | Batch → control plane |
-| VPN client app | Allow-all (no BeforeDial) | Local log file |
-| IoT device mesh | Identity-based allow-list | MQTT publish |
-| Testing / CI | None | None |
+| Use case | Policy | Inbound | Audit |
+|---|---|---|---|
+| AI agent sandbox | EgressFilter CIDR allowlist | ForwardListener | Batch → control plane |
+| VPN client app | Allow-all | — | Local log file |
+| IoT device mesh | Identity-based | — | MQTT publish |
+| Testing / CI | None | — | None |
 
 ---
 
@@ -373,22 +498,25 @@ go test ./shim
 go vet ./shim
 ```
 
-The library imports only the Go standard library plus `gvisor.dev/gvisor`
-and (optionally) `golang.zx2c4.com/wireguard`.
+The library imports only the Go standard library plus `gvisor.dev/gvisor`.
+wireguard-go is an optional integration — inject it via `PeerManager` and
+`WireGuardEndpoint` from the caller.
 
 ---
 
 ## Design principles
 
 - **Zero Lattice deps.** The shim imports no Lattice packages. The Lattice
-  main repo implements `PolicyChecker` and `AuditWriter` by adapting its
-  own policy cache and audit batcher.
+  main repo implements `PolicyChecker`, `AuditWriter`, and `PeerManager` by
+  adapting its own policy cache, audit batcher, and wireguard-go device.
 - **Interfaces, not frameworks.** The shim defines narrow interfaces and the
   caller injects concrete implementations.
 - **Zero privilege.** The entire data path runs in user space — no TUN
   device, no `CAP_NET_ADMIN`, no root.
 - **Standard `net.Conn`.** Connections returned by `DialContext` are ordinary
   `net.Conn` values, so all standard Go networking code works unchanged.
+- **Hot-reload.** `EgressFilter.Update()` and `Sandbox.AddPeer()` replace
+  policy and peer state atomically without restarting the sandbox process.
 
 ---
 
