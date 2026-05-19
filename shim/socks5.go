@@ -42,13 +42,20 @@ const (
 	socks5ReplyAddrNotSupported = 0x08
 )
 
+// ContextDialer is the interface for dialing connections through a
+// network stack. Both *Netstack and any type with a matching DialContext
+// method satisfy this interface.
+type ContextDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
 // Socks5Server is a SOCKS5 proxy that tunnels TCP connections through a
-// gVisor-based Netstack. It listens on the host network and routes each
-// proxied connection through Netstack.DialContext so that policy and
-// audit hooks on the Netstack apply transparently.
+// ContextDialer. It listens on the host network and routes each proxied
+// connection through dial.DialContext so that policy and audit hooks
+// apply transparently.
 type Socks5Server struct {
-	ns *Netstack
-	ln net.Listener
+	dial ContextDialer
+	ln   net.Listener
 
 	dialTimeout time.Duration
 
@@ -70,15 +77,15 @@ func WithDialTimeout(d time.Duration) Socks5Option {
 
 // NewSocks5Server creates a SOCKS5 server that listens on the given host
 // address (e.g., "127.0.0.1:1080") and tunnels TCP connections through
-// the Netstack.
-func NewSocks5Server(ns *Netstack, addr string, opts ...Socks5Option) (*Socks5Server, error) {
+// the ContextDialer.
+func NewSocks5Server(dial ContextDialer, addr string, opts ...Socks5Option) (*Socks5Server, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("socks5 listen: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Socks5Server{
-		ns:          ns,
+		dial:        dial,
 		ln:          ln,
 		dialTimeout: 30 * time.Second,
 		ctx:         ctx,
@@ -141,7 +148,7 @@ func (s *Socks5Server) handle(client net.Conn) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.dialTimeout)
 	defer cancel()
 
-	remote, err := s.ns.DialContext(ctx, "tcp", targetAddr)
+	remote, err := s.dial.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
 		s.sendReply(client, socks5ReplyGeneralFailure, &net.TCPAddr{IP: net.IPv4zero, Port: 0})
 		return
